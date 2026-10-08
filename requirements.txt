@@ -1,0 +1,2 @@
+# ሁሉም የ Python ጥቅሎች (backend). ለ React: frontend/package.json → `npm install`
+-r backend/requirements.txt
