@@ -1,2 +1,9 @@
+<<<<<<< HEAD
 # ሁሉም የ Python ጥቅሎች (backend). ለ React: frontend/package.json → `npm install`
 -r backend/requirements.txt
+=======
+Django>=5.0,<6.0
+djangorestframework>=3.15
+whitenoise>=6.6
+gunicorn>=22.0
+>>>>>>> 8c147cfdf03cf2596d394b94b36a9bc9bf983cef
