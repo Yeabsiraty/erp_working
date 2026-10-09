@@ -2,11 +2,13 @@ from django.contrib.auth import authenticate
 from django.db.models import ProtectedError
 from rest_framework import permissions, status, viewsets
 from rest_framework.authtoken.models import Token
-from rest_framework.decorators import api_view, permission_classes
+from django.core import signing
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import ethiopian, services
+from . import services
+from . import ethiopian
 from .models import (BankEntry, Customer, DeliveryNote, Expense, Item, Payment, PaymentRequest, Proforma, Purchase,
                      Sale, ShopSettings)
 from .serializers import (BankEntrySerializer, CustomerSerializer, DeliveryNoteSerializer, ExpenseSerializer, ItemSerializer,
@@ -39,6 +41,32 @@ class LogoutView(APIView):
 class MeView(APIView):
     def get(self, request):
         return Response({"username": request.user.get_username()})
+    # ---------------------------------------------------------------- የባንክ መቆለፊያ
+BANK_SALT = "bank-access"
+BANK_MAX_AGE = 15 * 60  # 15 ደቂቃ
+
+
+class BankUnlocked(permissions.BasePermission):
+    message = "የባንክ ይለፍ ቃል ያስፈልጋል።"
+
+    def has_permission(self, request, view):
+        raw = request.query_params.get("bt", "")
+        try:
+            data = signing.loads(raw, salt=BANK_SALT, max_age=BANK_MAX_AGE)
+        except signing.BadSignature:
+            return False
+        return data.get("u") == request.user.pk
+
+
+class BankUnlockView(APIView):
+    def post(self, request):
+        user = authenticate(
+            username=request.user.get_username(),
+            password=str(request.data.get("password", "")),
+        )
+        if user is None or user.pk != request.user.pk:
+            return Response({"detail": "የይለፍ ቃሉ ትክክል አይደለም።"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"token": signing.dumps({"u": user.pk}, salt=BANK_SALT)})
 
 
 # ---------------------------------------------------------------- መሠረታዊ ViewSets
@@ -111,11 +139,29 @@ class PaymentViewSet(DatedViewSet):
     queryset = Payment.objects.select_related("customer")
     serializer_class = PaymentSerializer
 
+
 class BankEntryViewSet(DatedViewSet):
     queryset = BankEntry.objects.all()
     serializer_class = BankEntrySerializer
+    permission_classes = [permissions.IsAuthenticated, BankUnlocked]
 
-    
+    def destroy(self, request, *args, **kwargs):
+        if self.get_object().kind == BankEntry.DEBT:
+            return Response({"detail": "በዕዳ የገባ ገንዘብ አይሰረዝም፤ በ “ክፈል” ይዝጉት።"}, status=status.HTTP_409_CONFLICT)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"])
+    def pay(self, request, pk=None):
+        entry = self.get_object()
+        if entry.kind != BankEntry.DEBT or entry.repaid:
+            return Response({"detail": "ይህ ዕዳ አስቀድሞ ተከፍሏል።"}, status=status.HTTP_400_BAD_REQUEST)
+        now = ethiopian.today()
+        entry.repaid = True
+        entry.rep_y, entry.rep_m, entry.rep_d = now["y"], now["m"], now["d"]
+        entry.save(update_fields=["repaid", "rep_y", "rep_m", "rep_d"])
+        return Response(BankEntrySerializer(entry).data)
+
+
 class ProformaViewSet(DatedViewSet):
     queryset = Proforma.objects.prefetch_related("items")
     serializer_class = ProformaSerializer
@@ -175,3 +221,19 @@ def demo_load(request):
 def demo_clear(request):
     services.clear_demo()
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+
+@api_view(["GET"])
+@permission_classes([permissions.IsAuthenticated, BankUnlocked])
+def bank_summary(request):
+    t = ethiopian.today()
+
+    def num(key, default):
+        raw = request.query_params.get(key, "")
+        return int(raw) if raw.isdigit() else default
+
+    y, m = num("y", t["y"]), num("m", t["m"])
+    if not 1 <= m <= 13:
+        m = t["m"]
+    return Response(services.bank_summary(y, m))

@@ -3,7 +3,8 @@ from datetime import date
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
-from . import ethiopian, services
+from . import services
+from . import ethiopian
 from .models import Customer, Item
 
 

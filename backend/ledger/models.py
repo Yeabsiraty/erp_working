@@ -104,7 +104,14 @@ class BankEntry(Dated):
     amount = money()
     kind = models.CharField(max_length=10, choices=KINDS, default=OWN)
     reason = models.CharField("ምክንያት", max_length=200, blank=True)
-    
+    # በዕዳ የገባ ገንዘብ ሲመለስ
+    repaid = models.BooleanField(default=False)
+    rep_y = models.PositiveSmallIntegerField(null=True, blank=True)
+    rep_m = models.PositiveSmallIntegerField(null=True, blank=True)
+    rep_d = models.PositiveSmallIntegerField(null=True, blank=True)
+
+
+
 
 class Proforma(Dated):
     seq = models.PositiveIntegerField("ተራ ቁጥር")

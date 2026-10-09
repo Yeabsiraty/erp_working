@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 
-from ledger import services
+from backend.ledger import services
 
 
 class Command(BaseCommand):

@@ -3,7 +3,8 @@ from decimal import Decimal
 from django.db import transaction
 from rest_framework import serializers
 
-from . import ethiopian, services
+from . import services
+from . import ethiopian
 from .models import (BankEntry, Customer, DeliveryNote, DeliveryNoteItem, Expense, Item, Payment, PaymentRequest, PaymentRequestItem, Proforma, ProformaItem,
                      Purchase, Sale, ShopSettings)
 
@@ -169,14 +170,22 @@ class PaymentSerializer(DatedSerializer):
 class BankEntrySerializer(DatedSerializer):
     class Meta:
         model = BankEntry
-        fields = ["id", "y", "m", "d", "amount", "kind", "reason", "demo"]
-        read_only_fields = ["demo"]
+        fields = ["id", "y", "m", "d", "amount", "kind", "reason",
+                  "repaid", "rep_y", "rep_m", "rep_d", "demo"]
+        read_only_fields = ["repaid", "rep_y", "rep_m", "rep_d", "demo"]
 
     def validate_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError("ገንዘቡ ከ0 በላይ መሆን አለበት።")
         return value
-# ---------------------------------------------------------------- ፕሮፎርማ
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if self.instance and self.instance.repaid:
+            raise serializers.ValidationError({"amount": "የተከፈለ ዕዳ ማስተካከል አይቻልም።"})
+        return attrs
+
+
 class ProformaItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProformaItem

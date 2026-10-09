@@ -75,29 +75,63 @@ def customer_stats(customers=None) -> dict:
 
 
 # ---------------------------------------------------------------- ዳሽቦርድ
+# ---------------------------------------------------------------- ዳሽቦርድ
 def _sum(qs, expr=None, field=None):
-    key = "t"
-    agg = qs.aggregate(**{key: Sum(expr if expr is not None else field)})
-    return r2(agg[key])
+    agg = qs.aggregate(t=Sum(expr if expr is not None else field))
+    return r2(agg["t"])
+
+
+def _pct(cur, prev):
+    """ለውጥ በመቶኛ፤ ቀዳሚው 0 ከሆነ None (UI "—" ያሳያል)።"""
+    prev = Decimal(prev or 0)
+    if prev == 0:
+        return None
+    diff = (Decimal(cur or 0) - prev) / abs(prev) * 100
+    return float(diff.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def _prev_day(y, m, d):
+    if d > 1:
+        return y, m, d - 1
+    if m > 1:
+        return y, m - 1, ethiopian.max_day(y, m - 1)
+    return y - 1, 13, ethiopian.max_day(y - 1, 13)
+
+
+def _prev_month(y, m):
+    return (y, m - 1) if m > 1 else (y - 1, 13)
+
+
+def _sales_of(**flt):
+    return _sum(Sale.objects.filter(**flt), expr=SALE_TOTAL)
+
+
+def _net_of(**flt):
+    s = _sum(Sale.objects.filter(**flt), expr=SALE_TOTAL)
+    c = _sum(Sale.objects.filter(**flt), expr=SALE_COST)
+    e = _sum(Expense.objects.filter(**flt), field="amount")
+    return s - c - e
 
 
 def _cash_totals(**flt) -> tuple:
-    """(ገቢ, ወጪ) — ገንዘብ በእውነት የገባና የወጣ፦
-    ገቢ = የጥሬ ሽያጭ + በዱቤ ሽያጭ ላይ የተከፈለ ቅድመ ክፍያ + የዕዳ ክፍያዎች ፣ ወጪ = ግዢ + ወጪዎች።
-    (ዱቤ ገና ያልተከፈለው ገንዘብ አልገባም፤ እንደ "ተቀባይ ዕዳ" በካፒታል ውስጥ ይቆጠራል።)"""
+    """(ገቢ, ወጪ) — ገንዘብ በእውነት የገባና የወጣ።
+    ገቢ = ጥሬ ሽያጭ + ቅድመ ክፍያ + የዕዳ ክፍያዎች + ባንክ የገባ ገንዘብ
+    ወጪ = ግዢ + ወጪዎች + ለአበዳሪ የተመለሰ ገንዘብ"""
     cash_sales = _sum(Sale.objects.filter(type=Sale.CASH, **flt), expr=SALE_TOTAL)
     upfront = _sum(Sale.objects.filter(type=Sale.CREDIT, **flt), field="paid")
     collected = _sum(Payment.objects.filter(**flt), field="amount")
+    deposits = _sum(BankEntry.objects.filter(**flt), field="amount")
     bought = _sum(Purchase.objects.filter(**flt), expr=SALE_TOTAL)
     spent = _sum(Expense.objects.filter(**flt), field="amount")
-    deposits = _sum(BankEntry.objects.filter(**flt), field="amount")
-    return cash_sales + upfront + collected + deposits, bought + spent
+    rflt = {"rep_" + k: v for k, v in flt.items()}
+    repaid = _sum(BankEntry.objects.filter(repaid=True, **rflt), field="amount")
+    return cash_sales + upfront + collected + deposits, bought + spent + repaid
 
 
 def _cash_year(y: int) -> dict:
     """{ወር: (ገቢ, ወጪ)} ለአንድ ዓመት።"""
-    def by_month(qs, expr):
-        return {r["m"]: r["t"] for r in qs.values("m").order_by().annotate(t=Sum(expr))}
+    def by_month(qs, expr, key="m"):
+        return {r[key]: r["t"] for r in qs.values(key).order_by().annotate(t=Sum(expr))}
     inc = {}
     for src in (by_month(Sale.objects.filter(y=y, type=Sale.CASH), SALE_TOTAL),
                 by_month(Sale.objects.filter(y=y, type=Sale.CREDIT), F("paid")),
@@ -107,19 +141,103 @@ def _cash_year(y: int) -> dict:
             inc[k] = inc.get(k, ZERO) + (v or ZERO)
     out = {}
     for src in (by_month(Purchase.objects.filter(y=y), SALE_TOTAL),
-                by_month(Expense.objects.filter(y=y), F("amount"))):
+                by_month(Expense.objects.filter(y=y), F("amount")),
+                by_month(BankEntry.objects.filter(repaid=True, rep_y=y), F("amount"), "rep_m")):
         for k, v in src.items():
             out[k] = out.get(k, ZERO) + (v or ZERO)
     return {mm: (r2(inc.get(mm)), r2(out.get(mm))) for mm in range(1, 14)}
 
 
 def dashboard(y: int, m: int, d: int) -> dict:
+    """ለዳሽቦርድ — ሽያጭና ክምችት ብቻ። ትርፍ፣ ገንዘብና ካፒታል እዚህ የለም (bank_summary ውስጥ ነው)።"""
+    stats = item_stats()
+    items = {i.pk: i for i in Item.objects.all()}
+    rows = [(items[pk], st) for pk, st in stats.items()]
+    cust = customer_stats()
+    cust_names = {c.pk: c.name for c in Customer.objects.all()}
+
+    sales_year = {r["m"]: r for r in
+                  Sale.objects.filter(y=y).values("m").order_by()
+                  .annotate(sales=Sum(SALE_TOTAL), cost=Sum(SALE_COST))}
+    months = []
+    for mm in range(1, 14):
+        s = r2((sales_year.get(mm) or {}).get("sales"))
+        c = r2((sales_year.get(mm) or {}).get("cost"))
+        months.append({"m": mm, "sales": s, "cost": c})
+    cur = months[m - 1]
+
+    daily_raw = {r["d"]: r["t"] for r in
+                 Sale.objects.filter(y=y, m=m).values("d").order_by().annotate(t=Sum(SALE_TOTAL))}
+    daily = [{"d": dd, "sales": r2(daily_raw.get(dd))} for dd in range(1, ethiopian.max_day(y, m) + 1)]
+
+    day_sales = _sales_of(y=y, m=m, d=d)
+    py, pm, pd = _prev_day(y, m, d)
+    prev_day_sales = _sales_of(y=py, m=pm, d=pd)
+    pym, pmm = _prev_month(y, m)
+    prev_month_sales = _sales_of(y=pym, m=pmm)
+
+    cash_m = _sum(Sale.objects.filter(y=y, m=m, type=Sale.CASH), expr=SALE_TOTAL)
+    credit_m = _sum(Sale.objects.filter(y=y, m=m, type=Sale.CREDIT), expr=SALE_TOTAL)
+
+    by_rev = sorted([x for x in rows if x[1]["revenue"] > 0], key=lambda x: -x[1]["revenue"])
+    share = [{"name": i.name, "value": st["revenue"]} for i, st in by_rev[:5]]
+    rest = sum((st["revenue"] for _, st in by_rev[5:]), ZERO)
+    if rest > 0:
+        share.append({"name": "", "value": rest, "other": True})
+
+    def pack(i, st):
+        return {"name": i.name, "unit": i.unit, "sold": st["sold"], "profit": st["profit"],
+                "value": st["value"], "left": st["left"], "status": st["status"]}
+
+    top_qty = sorted([x for x in rows if x[1]["sold"] > 0], key=lambda x: -x[1]["sold"])[:5]
+    top_profit = sorted([x for x in rows if x[1]["profit"] > 0], key=lambda x: -x[1]["profit"])[:5]
+    top_value = sorted([x for x in rows if x[1]["value"] > 0], key=lambda x: -x[1]["value"])[:5]
+    low = sorted([x for x in rows if x[1]["status"] != "ok"], key=lambda x: x[1]["left"])[:8]
+    top_debtors = sorted([(cust_names[pk], c["balance"]) for pk, c in cust.items() if c["balance"] > 0],
+                         key=lambda x: -x[1])[:5]
+
+    recent = [{"id": s.id, "y": s.y, "m": s.m, "d": s.d, "item": s.item.name,
+               "total": r2(s.qty * s.price), "type": s.type,
+               "customer": s.customer.name if s.customer else ""}
+              for s in Sale.objects.select_related("item", "customer")[:6]]
+
+    return {
+        "period": {"y": y, "m": m, "d": d},
+        "is_empty": not items,
+        "kpis": {
+            "day_sales": day_sales, "day_change": _pct(day_sales, prev_day_sales),
+            "month_sales": cur["sales"], "month_change": _pct(cur["sales"], prev_month_sales),
+            "stock_value": sum((st["value"] for _, st in rows), ZERO),
+            "debt_total": sum((c["balance"] for c in cust.values()), ZERO),
+            "debtors": sum(1 for c in cust.values() if c["balance"] > 0),
+            "low_count": sum(1 for _, st in rows if st["status"] != "ok"),
+            "out_count": sum(1 for _, st in rows if st["status"] == "out"),
+        },
+        "months": months,
+        "daily": daily,
+        "split": {"cash": cash_m, "credit": credit_m},
+        "share": share,
+        "stock_status": {
+            "ok": sum(1 for _, st in rows if st["status"] == "ok"),
+            "low": sum(1 for _, st in rows if st["status"] == "low"),
+            "out": sum(1 for _, st in rows if st["status"] == "out"),
+        },
+        "top_qty": [pack(i, st) for i, st in top_qty],
+        "top_profit": [pack(i, st) for i, st in top_profit],
+        "top_value": [pack(i, st) for i, st in top_value],
+        "low_stock": [pack(i, st) for i, st in low],
+        "top_debtors": [{"name": n, "balance": b} for n, b in top_debtors],
+        "recent": recent,
+    }
+
+
+def bank_summary(y: int, m: int) -> dict:
+    """ለባንክ ገጽ — ትርፍ፣ ገንዘብና ካፒታል (በይለፍ ቃል የተጠበቀ)።"""
     sales_year = {r["m"]: r for r in
                   Sale.objects.filter(y=y).values("m").order_by()
                   .annotate(sales=Sum(SALE_TOTAL), cost=Sum(SALE_COST))}
     exp_year = {r["m"]: r["t"] for r in
                 Expense.objects.filter(y=y).values("m").order_by().annotate(t=Sum("amount"))}
-
     months, tot = [], {"sales": ZERO, "cost": ZERO, "gross": ZERO, "expenses": ZERO, "net": ZERO}
     for mm in range(1, 14):
         s = r2((sales_year.get(mm) or {}).get("sales"))
@@ -129,37 +247,28 @@ def dashboard(y: int, m: int, d: int) -> dict:
         months.append(row)
         for k in tot:
             tot[k] += row[k]
+    cur = months[m - 1]
+    pym, pmm = _prev_month(y, m)
+    prev_net = _net_of(y=pym, m=pmm)
+    prev_year_net = _net_of(y=y - 1)
 
-    cur = months[m - 1] if 1 <= m <= 13 else months[0]
-    day_sales = _sum(Sale.objects.filter(y=y, m=m, d=d), expr=SALE_TOTAL)
+    bank_all = _sum(BankEntry.objects.all(), field="amount")
+    bank_debt = _sum(BankEntry.objects.filter(kind=BankEntry.DEBT, repaid=False), field="amount")
+    repaid_total = _sum(BankEntry.objects.filter(repaid=True), field="amount")
 
     stats = item_stats()
-    items = {i.pk: i for i in Item.objects.all()}
-    rows = [(items[pk], st) for pk, st in stats.items()]
-    cust = customer_stats()
+    stock_value = sum((st["value"] for st in stats.values()), ZERO)
+    opening_stock = r2(sum((i.init * i.buy for i in Item.objects.all()), ZERO))
+    receivables = sum((c["balance"] for c in customer_stats().values()), ZERO)
 
-    def pack(i, st):
-        return {"name": i.name, "unit": i.unit, "sold": st["sold"], "profit": st["profit"],
-                "left": st["left"], "status": st["status"]}
-
-    top_qty = sorted([x for x in rows if x[1]["sold"] > 0], key=lambda x: -x[1]["sold"])[:5]
-    top_profit = sorted([x for x in rows if x[1]["profit"] > 0], key=lambda x: -x[1]["profit"])[:5]
-    low = sorted([x for x in rows if x[1]["status"] != "ok"], key=lambda x: x[1]["left"])[:8]
-
-    # ---- ካፒታልና የገንዘብ ፍሰት ----
-    opening_cash = ZERO  # መነሻ ገንዘብ አሁን ከባንክ መዝገብ ነው የሚመጣው
-    bank_all = _sum(BankEntry.objects.all(), field="amount")
-    bank_debt = _sum(BankEntry.objects.filter(kind=BankEntry.DEBT), field="amount")
     in_all, out_all = _cash_totals()
-    cash_balance = opening_cash + in_all - out_all
-    stock_value = sum((st["value"] for _, st in rows), ZERO)
-    receivables = sum((c["balance"] for c in cust.values()), ZERO)
-    opening_stock = r2(sum((i.init * i.buy for i in items.values()), ZERO))
-    initial_capital = bank_all + opening_stock
+    cash_balance = in_all - out_all
+    initial = bank_all - repaid_total + opening_stock
     capital_balance = cash_balance + stock_value + receivables
 
     in_before, out_before = _cash_totals(y__lt=y)
-    running = opening_cash + in_before - out_before
+    opening = in_before - out_before
+    running = opening
     flows = _cash_year(y)
     cash_months = []
     for mm in range(1, 14):
@@ -168,40 +277,32 @@ def dashboard(y: int, m: int, d: int) -> dict:
         cash_months.append({"m": mm, "inflow": cin, "outflow": cout, "net": cin - cout, "balance": running})
     year_in = sum((r["inflow"] for r in cash_months), ZERO)
     year_out = sum((r["outflow"] for r in cash_months), ZERO)
-    cur_cash = cash_months[m - 1] if 1 <= m <= 13 else cash_months[0]
+    cur_cash = cash_months[m - 1]
+    prev_balance = cash_months[m - 2]["balance"] if m > 1 else opening
 
     return {
-        "period": {"y": y, "m": m, "d": d},
+        "period": {"y": y, "m": m},
+        "profit": {
+            "month_net": cur["net"], "month_net_change": _pct(cur["net"], prev_net),
+            "month_gross": cur["gross"], "month_expenses": cur["expenses"],
+            "year_net": tot["net"], "year_net_change": _pct(tot["net"], prev_year_net),
+            "year_sales": tot["sales"],
+        },
         "capital": {
-            "opening_cash": bank_all, "opening_stock": opening_stock, "initial": initial_capital,
+            "opening_stock": opening_stock, "initial": initial,
             "cash": cash_balance, "stock": stock_value, "receivables": receivables,
-            "balance": capital_balance, "growth": capital_balance - initial_capital,
+            "balance": capital_balance, "growth": capital_balance - initial,
+            "change": _pct(capital_balance, initial),
         },
         "cashflow": {
-            "balance": cash_balance, "opening": opening_cash + in_before - out_before, "bank_debt": bank_debt,
+            "balance": cash_balance, "balance_change": _pct(cash_balance, prev_balance),
+            "bank_debt": bank_debt,
             "month_in": cur_cash["inflow"], "month_out": cur_cash["outflow"], "month_net": cur_cash["net"],
             "year_in": year_in, "year_out": year_out, "year_net": year_in - year_out,
             "months": cash_months,
         },
-        "is_empty": not items,
-        "kpis": {
-            "day_sales": day_sales,
-            "month_sales": cur["sales"], "month_gross": cur["gross"],
-            "month_expenses": cur["expenses"], "month_net": cur["net"],
-            "year_sales": tot["sales"], "year_net": tot["net"],
-            "stock_value": sum((st["value"] for _, st in rows), ZERO),
-            "debt_total": sum((c["balance"] for c in cust.values()), ZERO),
-            "debtors": sum(1 for c in cust.values() if c["balance"] > 0),
-            "low_count": sum(1 for _, st in rows if st["status"] != "ok"),
-        },
         "months": months,
-        "year_total": tot,
-        "top_qty": [pack(i, st) for i, st in top_qty],
-        "top_profit": [pack(i, st) for i, st in top_profit],
-        "low_stock": [pack(i, st) for i, st in low],
     }
-
-
 # ---------------------------------------------------------------- ፕሮፎርማ
 def proforma_totals(items, rate) -> dict:
     """items፦ price እና qty ያላቸው ዕቃዎች። TOT በ 2 አስርዮሽ ይጠጋል።"""
