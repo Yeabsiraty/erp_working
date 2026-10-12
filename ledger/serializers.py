@@ -73,12 +73,29 @@ class SaleSerializer(DatedSerializer):
     total = serializers.SerializerMethodField()
     cost = serializers.SerializerMethodField()
     profit = serializers.SerializerMethodField()
+    settled = serializers.SerializerMethodField()
+    balance = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
         fields = ["id", "y", "m", "d", "item", "item_name", "qty", "price", "type",
-                  "customer", "customer_name", "paid", "total", "cost", "profit", "demo"]
+                  "customer", "customer_name", "paid", "total", "cost", "profit",
+                  "settled", "balance", "demo"]
         read_only_fields = ["demo"]
+
+    def _settle(self, obj):
+        if obj.type != Sale.CREDIT:
+            return {"settled": True, "balance": Decimal("0")}
+        table = self.context.get("settle")
+        if table is None:
+            table = services.credit_settlement([obj.customer_id])
+        return table.get(obj.pk, {"settled": False, "balance": services.r2(obj.qty * obj.price - obj.paid)})
+
+    def get_settled(self, obj):
+        return self._settle(obj)["settled"]
+
+    def get_balance(self, obj):
+        return self._settle(obj)["balance"]
 
     def get_item_name(self, obj):
         return obj.item.name

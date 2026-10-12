@@ -1,10 +1,11 @@
 from django.contrib.auth import authenticate
+from django.core import signing
 from django.db.models import ProtectedError
 from rest_framework import permissions, status, viewsets
 from rest_framework.authtoken.models import Token
-from django.core import signing
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 
 from . import services
@@ -40,39 +41,100 @@ class LogoutView(APIView):
 
 class MeView(APIView):
     def get(self, request):
-        return Response({"username": request.user.get_username()})
-    # ---------------------------------------------------------------- የባንክ መቆለፊያ
-BANK_SALT = "bank-access"
-BANK_MAX_AGE = 15 * 60  # 15 ደቂቃ
+        u = request.user
+        return Response({"username": u.get_username(), "is_superuser": u.is_superuser, "is_staff": u.is_staff})
 
 
-class BankUnlocked(permissions.BasePermission):
-    message = "የባንክ ይለፍ ቃል ያስፈልጋል።"
+# ---------------------------------------------------------------- የይለፍ ቃል መቆለፊያዎች
+BANK_SALT, BANK_MAX_AGE = "bank-access", 15 * 60          # 15 ደቂቃ
+REPORT_SALT, REPORT_MAX_AGE = "report-access", 15 * 60    # 15 ደቂቃ
+ACTION_SALT, ACTION_MAX_AGE = "action-password", 30 * 60  # ለማስተካከል/ለመሰረዝ — 30 ደቂቃ
+
+
+def _valid_token(request, param, salt, max_age) -> bool:
+    raw = request.query_params.get(param, "")
+    try:
+        data = signing.loads(raw, salt=salt, max_age=max_age)
+    except signing.BadSignature:  # SignatureExpired ን ጨምሮ
+        return False
+    return data.get("u") == request.user.pk
+
+
+class IsSuperuser(permissions.BasePermission):
+    message = "ይህ ክፍል ለዋና አስተዳዳሪ (superuser) ብቻ ነው።"
 
     def has_permission(self, request, view):
-        raw = request.query_params.get("bt", "")
-        try:
-            data = signing.loads(raw, salt=BANK_SALT, max_age=BANK_MAX_AGE)
-        except signing.BadSignature:
-            return False
-        return data.get("u") == request.user.pk
+        u = request.user
+        return bool(u and u.is_authenticated and u.is_superuser)
 
 
-class BankUnlockView(APIView):
+class _TokenGate(IsSuperuser):
+    param, salt, max_age = "", "", 0
+
+    def has_permission(self, request, view):
+        return super().has_permission(request, view) and _valid_token(request, self.param, self.salt, self.max_age)
+
+
+class BankUnlocked(_TokenGate):
+    message = "የባንክ ይለፍ ቃል ያስፈልጋል።"
+    param, salt, max_age = "bt", BANK_SALT, BANK_MAX_AGE
+
+
+class ReportUnlocked(_TokenGate):
+    message = "የሪፖርት ይለፍ ቃል ያስፈልጋል።"
+    param, salt, max_age = "rt", REPORT_SALT, REPORT_MAX_AGE
+
+
+class PasswordRequiredForChange(permissions.BasePermission):
+    """PUT / PATCH / DELETE የሚፈቀዱት በቅርብ ጊዜ ይለፍ ቃል ካረጋገጠ ተጠቃሚ ብቻ ነው (?at=<token>)።"""
+
+    message = "ለማስተካከል ወይም ለመሰረዝ የይለፍ ቃል ያስፈልጋል።"
+
+    def has_permission(self, request, view):
+        if request.method in ("PUT", "PATCH", "DELETE"):
+            return _valid_token(request, "at", ACTION_SALT, ACTION_MAX_AGE)
+        return True
+
+
+BASE_PERMS = [permissions.IsAuthenticated, PasswordRequiredForChange]
+
+
+class PasswordCheckThrottle(UserRateThrottle):
+    scope = "password_check"
+    rate = "10/min"
+
+
+class _PasswordView(APIView):
+    throttle_classes = [PasswordCheckThrottle]
+    salt = ""
+    require_superuser = False
+
     def post(self, request):
+        if self.require_superuser and not request.user.is_superuser:
+            return Response({"detail": IsSuperuser.message}, status=status.HTTP_403_FORBIDDEN)
         user = authenticate(
             username=request.user.get_username(),
             password=str(request.data.get("password", "")),
         )
         if user is None or user.pk != request.user.pk:
             return Response({"detail": "የይለፍ ቃሉ ትክክል አይደለም።"}, status=status.HTTP_400_BAD_REQUEST)
-        return Response({"token": signing.dumps({"u": user.pk}, salt=BANK_SALT)})
+        return Response({"token": signing.dumps({"u": user.pk}, salt=self.salt)})
+
+
+class BankUnlockView(_PasswordView):
+    salt, require_superuser = BANK_SALT, True
+
+
+class ReportUnlockView(_PasswordView):
+    salt, require_superuser = REPORT_SALT, True
+
+
+class VerifyPasswordView(_PasswordView):
+    salt = ACTION_SALT
 
 
 # ---------------------------------------------------------------- መሠረታዊ ViewSets
 class ProtectedDeleteMixin:
-    """ሌላ መዝገብ የሚጠቀመውን ዕቃ/ደንበኛ መሰረዝን በግልጽ መልዕክት ይከለክላል።"""
-
     protected_message = "ይህ መዝገብ በሌሎች መዝገቦች ጥቅም ላይ ስለዋለ መሰረዝ አይቻልም።"
 
     def destroy(self, request, *args, **kwargs):
@@ -84,6 +146,8 @@ class ProtectedDeleteMixin:
 
 class DatedViewSet(viewsets.ModelViewSet):
     """?y= ?m= ?d= ?limit= ማጣሪያዎችን ይቀበላል።"""
+
+    permission_classes = BASE_PERMS
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -99,6 +163,7 @@ class DatedViewSet(viewsets.ModelViewSet):
 class ItemViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Item.objects.all()
     serializer_class = ItemSerializer
+    permission_classes = BASE_PERMS
     protected_message = "ይህ ዕቃ ሽያጭ ወይም ግዢ ስላለው መሰረዝ አይቻልም። መጀመሪያ እነዚያን ይሰርዙ።"
 
     def get_serializer_context(self):
@@ -111,6 +176,7 @@ class ItemViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
 class CustomerViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Customer.objects.all()
     serializer_class = CustomerSerializer
+    permission_classes = BASE_PERMS
     protected_message = "ይህ ደንበኛ ሽያጭ ወይም ክፍያ ስላለው መሰረዝ አይቻልም።"
 
     def get_serializer_context(self):
@@ -123,6 +189,12 @@ class CustomerViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
 class SaleViewSet(DatedViewSet):
     queryset = Sale.objects.select_related("item", "customer")
     serializer_class = SaleSerializer
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.action == "list":
+            ctx["settle"] = services.credit_settlement()
+        return ctx
 
 
 class PurchaseViewSet(DatedViewSet):
@@ -143,7 +215,7 @@ class PaymentViewSet(DatedViewSet):
 class BankEntryViewSet(DatedViewSet):
     queryset = BankEntry.objects.all()
     serializer_class = BankEntrySerializer
-    permission_classes = [permissions.IsAuthenticated, BankUnlocked]
+    permission_classes = [permissions.IsAuthenticated, BankUnlocked, PasswordRequiredForChange]
 
     def destroy(self, request, *args, **kwargs):
         if self.get_object().kind == BankEntry.DEBT:
@@ -223,7 +295,6 @@ def demo_clear(request):
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated, BankUnlocked])
 def bank_summary(request):
@@ -233,7 +304,37 @@ def bank_summary(request):
         raw = request.query_params.get(key, "")
         return int(raw) if raw.isdigit() else default
 
-    y, m = num("y", t["y"]), num("m", t["m"])
+    y, m, d = num("y", t["y"]), num("m", t["m"]), num("d", t["d"])
     if not 1 <= m <= 13:
         m = t["m"]
-    return Response(services.bank_summary(y, m))
+    return Response(services.bank_summary(y, m, d))
+
+
+@api_view(["GET"])
+@permission_classes([permissions.IsAuthenticated, ReportUnlocked])
+def report_view(request):
+    p = request.query_params
+    t = ethiopian.today()
+
+    def parse(key, default):
+        try:
+            y, m, d = (int(x) for x in p.get(key, "").split("-"))
+        except ValueError:
+            return default
+        return (y, m, d) if ethiopian.is_valid(y, m, d) else default
+
+    def pk(key):
+        raw = p.get(key, "")
+        return int(raw) if raw.isdigit() else None
+
+    start = parse("from", (t["y"], 1, 1))
+    end = parse("to", (t["y"], t["m"], t["d"]))
+    if start > end:
+        start, end = end, start
+    wanted = {s for s in p.get("sections", "").split(",") if s in services.ALL_SECTIONS}
+    return Response(services.report(
+        start=start, end=end, sections=wanted or set(services.ALL_SECTIONS),
+        item=pk("item"), customer=pk("customer"), sale_type=p.get("type", ""),
+        category=p.get("category", "").strip(), bank_kind=p.get("bank_kind", ""),
+        debt_status=p.get("debt_status", ""),
+    ))
