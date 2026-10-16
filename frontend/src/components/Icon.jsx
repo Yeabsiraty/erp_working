@@ -20,6 +20,7 @@ const PATHS = {
   check: "M5 12.5l4.5 4.5L19 7.5",
   search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z M20 20l-3.5-3.5",
   open: "M14 4h6v6 M20 4l-9 9 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+    copy: "M9 9h11v11H9z M5 15V4h11",
 };
 
 export default function Icon({ name, size = 20, className = "" }) {

@@ -1,13 +1,16 @@
 import { useState } from "react";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { api, qs } from "../lib/api.js";
 import { dstr, todayEth } from "../lib/ethiopian.js";
 import { dateOf, num, useSubmit } from "../lib/forms.js";
 import { fmt, fmt0, r2 } from "../lib/format.js";
 import { useResource, useToast } from "../lib/hooks.jsx";
 import Period from "../components/Period.jsx";
-import Icon from "../components/Icon.jsx";
-import { Button, Card, ConfirmDelete, DateField, Drawer, Empty, ErrorNote, Field, Loading, PageHeader, Segmented, StatusPill } from "../components/ui.jsx";
+import SmartDateField from "../components/SmartDateField.jsx";
+import { GuardedDelete, GuardedEdit, withAt } from "../components/Guard.jsx";
+import { ALL, FilterSelect, SearchBar, Toolbar, hit } from "../components/ListTools.jsx";
+import { Button, Card, Drawer, Empty, ErrorNote, Field, Loading, PageHeader, Segmented, StatusPill } from "../components/ui.jsx";
 
 const blankItem = () => ({ name: "", unit: t("ፍሬ"), buy: "", sell: "", init: 0, low: 5 });
 const blankBuy = () => ({ ...todayEth(), item: "", qty: "", price: "", supplier: "" });
@@ -19,11 +22,18 @@ export default function Stock() {
   const [per, setPer] = useState({ y: now.y, m: 0 });
   const items = useResource("/items/");
   const buys = useResource(`/purchases/${qs({ y: per.y, m: per.m || "" })}`);
-  const [form, setForm] = useState(null); // {kind, id, ...}
+  const [form, setForm] = useState(null);
+  const [grant, setGrant] = useState(null);
   const [busy, run] = useSubmit();
   const set = (p) => setForm((f) => ({ ...f, ...p }));
-
   const reloadAll = () => { items.reload(); buys.reload(); };
+
+  const [search, setSearch] = useState("");
+ 
+  const [statusF, setStatusF] = useState("all");
+  const [itemF, setItemF] = useState("all");
+  const switchTab = (v) => { setTab(v); setSearch(""); setStatusF("all"); setItemF("all"); };
+
   const save = async (e) => {
     e.preventDefault();
     const { kind, id, ...v } = form;
@@ -35,11 +45,14 @@ export default function Stock() {
       path = "/purchases/";
       body = { y: num(v.y), m: num(v.m), d: num(v.d), item: v.item, qty: num(v.qty), price: num(v.price), supplier: v.supplier };
     }
-    const ok = await run(() => (id ? api.put(`${path}${id}/`, body) : api.post(path, body)));
+    const ok = await run(() => {
+      if (id) return api.put(withAt(`${path}${id}/`, grant), body);
+      return api.post(kind === "pay" ? withAt(path, grant) : path, body);  // new payment needs the password token
+    });
     if (ok) { setForm(null); reloadAll(); }
   };
-  const remove = async (path, id) => {
-    try { await api.del(`${path}${id}/`); toast(t("ተሰርዟል"), "del"); reloadAll(); } catch (e) { toast(e.message, "err"); }
+  const remove = async (path, id, token) => {
+    try { await api.del(withAt(`${path}${id}/`, token)); toast(t("ተሰርዟል"), "del"); reloadAll(); } catch (e) { toast(e.message, "err"); }
   };
 
   const list = items.data || [];
@@ -49,27 +62,56 @@ export default function Stock() {
     set({ item: id === "" ? "" : Number(id), ...(it && !form.id ? { price: it.buy } : {}) });
   };
 
+  const itemRows = list.filter((i) => {
+    if (statusF !== "all" && i.status !== statusF) return false;
+    return hit(search, i.name);
+  });
+  const buyRows = (buys.data || []).filter((b) => {
+    if (itemF !== "all" && String(b.item) !== itemF) return false;
+    return hit(search, b.item_name);
+  });
+  const filtering = !!search || statusF !== "all" || itemF !== "all";
+  const resetFilters = () => { setSearch(""); setStatusF("all"); setItemF("all"); };
+
   return (
     <>
       <PageHeader title={t("ክምችት")} subtitle={t("{n} ዕቃዎች · ዋጋ {v} ብር", { n: list.length, v: fmt(stockValue) })}>
         {tab === "buys" && <Period value={per} onChange={setPer} />}
-        <Button icon="plus" onClick={() => setForm(tab === "items" ? { kind: "item", ...blankItem() } : { kind: "buy", ...blankBuy() })}>
+        <Button icon="plus" onClick={() => { setGrant(null); setForm(tab === "items" ? { kind: "item", ...blankItem() } : { kind: "buy", ...blankBuy() }); }}>
           {tab === "items" ? t("አዲስ ዕቃ") : t("ግዢ መዝግብ")}
         </Button>
       </PageHeader>
       <div className="tabs">
-        <Segmented value={tab} onChange={setTab} options={[{ value: "items", label: t("ዕቃዎች") }, { value: "buys", label: t("ግዢዎች") }]} />
+        <Segmented value={tab} onChange={switchTab} options={[{ value: "items", label: t("ዕቃዎች") }, { value: "buys", label: t("ግዢዎች") }]} />
       </div>
       <ErrorNote error={items.error || buys.error} retry={reloadAll} />
 
+            <Toolbar active={filtering} onReset={resetFilters}>
+        {tab === "items" ? (
+          <>
+            <SearchBar value={search} onChange={setSearch} placeholder={bi("የዕቃ ስም ፈልግ…", "Search item name…")} />
+            <FilterSelect label={t("ሁኔታ")} value={statusF} onChange={setStatusF} options={[
+              ALL(), { value: "ok", label: t("በቂ") }, { value: "low", label: t("ሊያልቅ ነው") }, { value: "out", label: t("አልቋል") },
+            ]} />
+          </>
+        ) : (
+          <>
+            <SearchBar value={search} onChange={setSearch} placeholder={bi("የዕቃ ስም ፈልግ…", "Search item name…")} />
+            <FilterSelect label={t("ዕቃ")} value={itemF} onChange={setItemF} options={[
+              ALL(), ...list.map((i) => ({ value: String(i.id), label: i.name })),
+            ]} />
+          </>
+        )}
+      </Toolbar>
+
       {tab === "items" ? (
         <Card flush>
-          {items.loading && !items.data ? <Loading /> : list.length === 0 ? <Empty>{t("ገና ዕቃ አልተመዘገበም።")}</Empty> : (
+          {items.loading && !items.data ? <Loading /> : itemRows.length === 0 ? <Empty>{filtering ? bi("ከፍለጋው ጋር የሚመሳሰል የለም።", "Nothing matches your search.") : t("ገና ዕቃ አልተመዘገበም።")}</Empty> : (
             <div className="table-wrap">
               <table className="t">
                 <thead><tr><th>{t("ዕቃ")}</th><th className="num">{t("ቀሪ")}</th><th>{t("ሁኔታ")}</th><th className="num">{t("መግዣ")}</th><th className="num">{t("መሸጫ")}</th><th className="num">{t("የክምችት ዋጋ")}</th><th /></tr></thead>
                 <tbody>
-                  {list.map((i) => (
+                  {itemRows.map((i) => (
                     <tr key={i.id}>
                       <td className="strong">{i.name}</td>
                       <td className="num">{fmt0(i.left)} <span className="muted">{i.unit}</span></td>
@@ -78,8 +120,8 @@ export default function Stock() {
                       <td className="num">{fmt(i.sell)}</td>
                       <td className="num">{fmt(i.value)}</td>
                       <td className="act">
-                        <button className="icon-btn" aria-label={t("አስተካክል")} onClick={() => setForm({ kind: "item", id: i.id, name: i.name, unit: i.unit, buy: i.buy, sell: i.sell, init: i.init, low: i.low })}><Icon name="edit" size={17} /></button>
-                        <ConfirmDelete onConfirm={() => remove("/items/", i.id)} />
+                        <GuardedEdit onGranted={(tok) => { setGrant(tok); setForm({ kind: "item", id: i.id, name: i.name, unit: i.unit, buy: i.buy, sell: i.sell, init: i.init, low: i.low }); }} />
+                        <GuardedDelete onConfirm={(tok) => remove("/items/", i.id, tok)} />
                       </td>
                     </tr>
                   ))}
@@ -90,12 +132,12 @@ export default function Stock() {
         </Card>
       ) : (
         <Card flush>
-          {buys.loading && !buys.data ? <Loading /> : (buys.data || []).length === 0 ? <Empty>{t("በዚህ ጊዜ ግዢ የለም።")}</Empty> : (
+          {buys.loading && !buys.data ? <Loading /> : buyRows.length === 0 ? <Empty>{filtering ? bi("ከፍለጋው ጋር የሚመሳሰል የለም።", "Nothing matches your search.") : t("በዚህ ጊዜ ግዢ የለም።")}</Empty> : (
             <div className="table-wrap">
               <table className="t">
                 <thead><tr><th>{t("ቀን")}</th><th>{t("ዕቃ")}</th><th>{t("አቅራቢ")}</th><th className="num">{t("ብዛት")}</th><th className="num">{t("ዋጋ")}</th><th className="num">{t("ጠቅላላ")}</th><th /></tr></thead>
                 <tbody>
-                  {buys.data.map((b) => (
+                  {buyRows.map((b) => (
                     <tr key={b.id}>
                       <td className="muted">{dstr(b)}</td>
                       <td className="strong">{b.item_name}</td>
@@ -104,8 +146,8 @@ export default function Stock() {
                       <td className="num">{fmt(b.price)}</td>
                       <td className="num strong">{fmt(b.total)}</td>
                       <td className="act">
-                        <button className="icon-btn" aria-label={t("አስተካክል")} onClick={() => setForm({ kind: "buy", id: b.id, ...dateOf(b), item: b.item, qty: b.qty, price: b.price, supplier: b.supplier })}><Icon name="edit" size={17} /></button>
-                        <ConfirmDelete onConfirm={() => remove("/purchases/", b.id)} />
+                        <GuardedEdit onGranted={(tok) => { setGrant(tok); setForm({ kind: "buy", id: b.id, ...dateOf(b), item: b.item, qty: b.qty, price: b.price, supplier: b.supplier }); }} />
+                        <GuardedDelete onConfirm={(tok) => remove("/purchases/", b.id, tok)} />
                       </td>
                     </tr>
                   ))}
@@ -135,7 +177,7 @@ export default function Stock() {
         )}
         {form?.kind === "buy" && (
           <form className="form" onSubmit={save}>
-            <DateField value={form} onChange={set} />
+            <SmartDateField value={form} onChange={set} />
             <Field label={t("ዕቃ")}>
               <select value={form.item} onChange={(e) => pickBuyItem(e.target.value)} required>
                 <option value="">{t("— ይምረጡ —")}</option>

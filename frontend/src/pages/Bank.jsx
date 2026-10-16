@@ -1,31 +1,23 @@
 import { useEffect, useState } from "react";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { api } from "../lib/api.js";
 import { MONTHS, dstr, todayEth } from "../lib/ethiopian.js";
 import { num, useSubmit } from "../lib/forms.js";
 import { fmt } from "../lib/format.js";
+import { useMe } from "../lib/me.js";
 import { useResource, useToast } from "../lib/hooks.jsx";
 import { BarChart, Legend, LineChart } from "../components/Charts.jsx";
 import { Button, Card, Empty, ErrorNote, Field, Loading, PageHeader, Pill } from "../components/ui.jsx";
 import Icon from "../components/Icon.jsx";
 import { Donut, Kpi, Panel, compact } from "../components/Viz.jsx";
+import { NoAccess, Popup, UnlockGate, askPassword } from "../components/Guard.jsx";
+import { ALL, FilterSelect, SearchBar, Toolbar, hit } from "../components/ListTools.jsx";
 
 const GREEN = "#16a34a", ORANGE = "#f97316", RED = "#dc2626", BLUE = "#2563eb";
 const btn = (bg) => ({ background: bg, color: "#fff", border: 0, borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontWeight: 600, fontSize: 13 });
-const overlay = { position: "fixed", inset: 0, background: "rgba(2,6,23,.55)", backdropFilter: "blur(3px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 };
 const signed = (v) => `${Number(v) > 0 ? "+" : ""}${fmt(v)}`;
 const BLUES = ["#38bdf8", "#2563eb", "#22d3ee", "#818cf8"];
-
-function Popup({ onClose, onSubmit, children }) {
-  const Tag = onSubmit ? "form" : "div";
-  return (
-    <div style={overlay} onClick={onClose}>
-      <Tag className="card form" onClick={(e) => e.stopPropagation()} onSubmit={onSubmit} style={{ width: "100%", maxWidth: 400 }}>
-        {children}
-      </Tag>
-    </div>
-  );
-}
 
 const DebtIn = ({ value }) => (
   <span className="debt-in" title={t("በዕዳ የገባ ገንዘብ")}>
@@ -37,40 +29,6 @@ const DebtIn = ({ value }) => (
   </span>
 );
 
-/* ---------- የይለፍ ቃል በር ---------- */
-function Gate({ onOpen }) {
-  const [pw, setPw] = useState("");
-  const [busy, run] = useSubmit();
-  const submit = async (e) => {
-    e.preventDefault();
-    let tok = null;
-    const ok = await run(async () => { const r = await api.post("/auth/bank-unlock/", { password: pw }); tok = r?.token; }, "");
-    if (ok && tok) onOpen(tok); else setPw("");
-  };
-  return (
-    <>
-      <PageHeader title={t("ባንክ")} />
-      <Popup onSubmit={submit}>
-        <div style={{ textAlign: "center" }}>
-          <div className="lock-ic">
-            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
-          </div>
-          <h3 style={{ margin: "10px 0 4px" }}>{t("ባንክ")}</h3>
-          <p className="muted" style={{ margin: 0, fontSize: 13 }}>{t("የባንክ ገጽ የተጠበቀ ነው። ለመክፈት የይለፍ ቃልዎን ያስገቡ።")}</p>
-        </div>
-        <Field label={t("የይለፍ ቃል")}>
-          <input type="password" autoFocus required autoComplete="current-password" value={pw} onChange={(e) => setPw(e.target.value)} />
-        </Field>
-        <div className="form-actions">
-          <Button variant="ghost" type="button" onClick={() => { window.location.hash = "/"; }}>{t("ተመለስ")}</Button>
-          <Button type="submit" disabled={busy}>{busy ? t("በመክፈት ላይ…") : t("ክፈት")}</Button>
-        </div>
-      </Popup>
-    </>
-  );
-}
-
-/* ---------- የካፒታል ስብጥር ---------- */
 function Breakdown({ cap }) {
   const parts = [
     { key: "cash", label: t("ጥሬ ገንዘብ"), value: cap.cash },
@@ -93,15 +51,16 @@ function Breakdown({ cap }) {
   );
 }
 
-/* ---------- ዋናው ገጽ ---------- */
 export default function Bank() {
+  const me = useMe();
   const [token, setToken] = useState(null); // በማህደረ ትውስታ ብቻ — ገጹ ሲከፈት ሁልጊዜ ባዶ ነው
   useEffect(() => {
     if (!token) return undefined;
-    const id = setTimeout(() => setToken(null), 14 * 60 * 1000); // ቁልፉ ከማለቁ በፊት ይቆልፋል
+    const id = setTimeout(() => setToken(null), 14 * 60 * 1000);
     return () => clearTimeout(id);
   }, [token]);
-  if (!token) return <Gate onOpen={setToken} />;
+  if (me && !me.is_superuser) return <NoAccess />;
+  if (!token) return <UnlockGate title={t("ባንክ")} endpoint="/auth/bank-unlock/" onOpen={setToken} />;
   return <BankInner token={token} onLock={() => setToken(null)} />;
 }
 
@@ -109,14 +68,20 @@ function BankInner({ token, onLock }) {
   const toast = useToast();
   const q = encodeURIComponent(token);
   const u = (p) => `${p}?bt=${q}`;
+  const ua = (p, at) => `${p}?bt=${q}&at=${encodeURIComponent(at)}`;
   const list = useResource(u("/bank/"));
   const sum = useResource(u("/bank-summary/"));
   const [busy, run] = useSubmit();
-  const [modal, setModal] = useState(null); // null | "own" | "debt"
+  const [modal, setModal] = useState(null);
   const [form, setForm] = useState({ amount: "", reason: "" });
-  const [edit, setEdit] = useState(null);   // አንድ ረድፍ ብቻ
-  const [delId, setDelId] = useState(null);
+  const [edit, setEdit] = useState(null);   // {id,..., at}
+  const [del, setDel] = useState(null);     // {id, at}
   const [payId, setPayId] = useState(null);
+
+  const [search, setSearch] = useState("");
+ 
+  const [kindF, setKindF] = useState("all");
+  const [stateF, setStateF] = useState("all");
 
   const reloadAll = () => { list.reload(); sum.reload(); };
   const openModal = (kind) => { setForm({ amount: "", reason: "" }); setModal(kind); };
@@ -126,16 +91,23 @@ function BankInner({ token, onLock }) {
     const ok = await run(() => api.post(u("/bank/"), { ...todayEth(), amount: num(form.amount), kind: modal, reason: form.reason.trim() }));
     if (ok) { setModal(null); reloadAll(); }
   };
-  const startEdit = (r) => setEdit({ id: r.id, y: r.y, m: r.m, d: r.d, amount: r.amount, kind: r.kind, reason: r.reason || "" });
+  const askEdit = async (r) => {
+    const at = await askPassword("edit");
+    if (at) setEdit({ id: r.id, y: r.y, m: r.m, d: r.d, amount: r.amount, kind: r.kind, reason: r.reason || "", at });
+  };
   const saveEdit = async () => {
-    const ok = await run(() => api.put(u(`/bank/${edit.id}/`), { y: edit.y, m: edit.m, d: edit.d, amount: num(edit.amount), kind: edit.kind, reason: edit.reason.trim() }), undefined, "edit");
+    const ok = await run(() => api.put(ua(`/bank/${edit.id}/`, edit.at), { y: edit.y, m: edit.m, d: edit.d, amount: num(edit.amount), kind: edit.kind, reason: edit.reason.trim() }), undefined, "edit");
     if (ok) { setEdit(null); reloadAll(); }
   };
+  const askDelete = async (r) => {
+    const at = await askPassword("delete");
+    if (at) setDel({ id: r.id, at });   // ከዚያ "ይሰረዝ?" የማረጋገጫ መስኮት ይታያል
+  };
   const confirmRemove = async () => {
-    const id = delId;
-    setDelId(null);
+    const { id, at } = del;
+    setDel(null);
     try {
-      await api.del(u(`/bank/${id}/`));
+      await api.del(ua(`/bank/${id}/`, at));
       toast(t("ተሰርዟል"), "del");
       if (edit?.id === id) setEdit(null);
       reloadAll();
@@ -152,12 +124,21 @@ function BankInner({ token, onLock }) {
     } catch (e) { toast(e.message, "err"); }
   };
 
-  const rows = list.data || [];
+  const all = list.data || [];
+  const rows = all.filter((r) => {
+    if (kindF !== "all" && r.kind !== kindF) return false;
+    if (stateF === "open" && r.repaid) return false;
+    if (stateF === "repaid" && !r.repaid) return false;
+    return hit(search, r.reason, r.amount);
+  });
+  const filtering = !!search || kindF !== "all" || stateF !== "all";
+  const resetFilters = () => { setSearch(""); setKindF("all"); setStateF("all"); };
+
   const s = sum.data;
   const labels = s ? s.months.map((m) => MONTHS[m.m - 1].slice(0, 3)) : [];
   const names = s ? s.months.map((m) => MONTHS[m.m - 1]) : [];
-  const payRow = rows.find((r) => r.id === payId);
-  const delRow = rows.find((r) => r.id === delId);
+  const payRow = all.find((r) => r.id === payId);
+  const delRow = all.find((r) => r.id === del?.id);
 
   return (
     <>
@@ -180,6 +161,12 @@ function BankInner({ token, onLock }) {
 
         {s && (
           <>
+            <div className="dk-row two">
+              <Kpi tone="t1" icon={<Icon name="sales" size={17} />} label={t("የዛሬ ሽያጭ")} value={s.profit.day_sales} unit={t("ብር")}
+                change={s.profit.day_change} note={t("ከትናንት ጋር")} />
+              <Kpi tone="t3" icon={<Icon name="dashboard" size={17} />} label={t("የ{month} ሽያጭ", { month: MONTHS[s.period.m - 1] })} value={s.profit.month_sales} unit={t("ብር")}
+                change={s.profit.month_change} note={t("ከባለፈው ወር ጋር")} />
+            </div>
             <div className="dk-row">
               <Kpi tone="t1" icon={<Icon name="sales" size={17} />} label={t("የወሩ የተጣራ ትርፍ")} value={s.profit.month_net} unit={t("ብር")}
                 change={s.profit.month_net_change} note={t("ወጪ {v}", { v: fmt(s.profit.month_expenses) })} />
@@ -220,8 +207,19 @@ function BankInner({ token, onLock }) {
         )}
 
         <ErrorNote error={list.error} retry={list.reload} />
+
+        <Toolbar active={filtering} onReset={resetFilters}>
+          <SearchBar value={search} onChange={setSearch} placeholder={bi("ምክንያት ወይም ገንዘብ ፈልግ…", "Search reason or amount…")} />
+          <FilterSelect label={t("አይነት")} value={kindF} onChange={setKindF} options={[
+            ALL(), { value: "own", label: t("ያለ ዕዳ") }, { value: "debt", label: t("በዕዳ") },
+          ]} />
+          <FilterSelect label={t("ሁኔታ")} value={stateF} onChange={setStateF} options={[
+            ALL(), { value: "open", label: bi("ያልተመለሰ", "Not repaid") }, { value: "repaid", label: bi("የተመለሰ", "Repaid") },
+          ]} />
+        </Toolbar>
+
         <Card flush>
-          {list.loading && !list.data ? <Loading /> : rows.length === 0 ? <Empty>{t("ገና ገንዘብ አልተጨመረም።")}</Empty> : (
+          {list.loading && !list.data ? <Loading /> : rows.length === 0 ? <Empty>{filtering ? bi("ከፍለጋው ጋር የሚመሳሰል የለም።", "Nothing matches your search.") : t("ገና ገንዘብ አልተጨመረም።")}</Empty> : (
             <div className="table-wrap">
               <table className="t">
                 <thead>
@@ -262,10 +260,10 @@ function BankInner({ token, onLock }) {
                               <>
                                 {isEdit
                                   ? <button style={btn(GREEN)} disabled={busy} onClick={saveEdit}>{t("አስቀምጥ")}</button>
-                                  : <button style={btn(ORANGE)} onClick={() => startEdit(r)}>{t("አስተካክል")}</button>}
+                                  : <button style={btn(ORANGE)} onClick={() => askEdit(r)}>{t("አስተካክል")}</button>}
                                 {isDebt
                                   ? <button style={btn(BLUE)} onClick={() => setPayId(r.id)}>{t("ክፈል")}</button>
-                                  : <button style={btn(RED)} onClick={() => setDelId(r.id)}>{t("ሰርዝ")}</button>}
+                                  : <button style={btn(RED)} onClick={() => askDelete(r)}>{t("ሰርዝ")}</button>}
                               </>
                             )}
                           </div>
@@ -296,13 +294,13 @@ function BankInner({ token, onLock }) {
         </Popup>
       )}
 
-      {delId !== null && (
-        <Popup onClose={() => setDelId(null)}>
-          <h3 style={{ margin: 0 }}>{t("ይሰረዝ?")}</h3>
+      {del && (
+        <Popup onClose={() => setDel(null)}>
+          <h3 style={{ margin: 0 }}>{bi("እርግጠኛ ነዎት?", "Are you sure?")}</h3>
           <p className="muted" style={{ margin: 0 }}>{fmt(delRow?.amount ?? 0)} {t("ብር")} · {t("ይህ መዝገብ ከባንክ ይሰረዛል፤ ካፒታሉም ይቀየራል።")}</p>
           <div className="form-actions">
-            <Button variant="ghost" type="button" onClick={() => setDelId(null)}>{t("ተው")}</Button>
-            <Button variant="danger" type="button" onClick={confirmRemove}>{t("ሰርዝ")}</Button>
+            <Button variant="ghost" type="button" onClick={() => setDel(null)}>{t("ተው")}</Button>
+            <Button variant="danger" type="button" onClick={confirmRemove}>{bi("አዎ፣ ሰርዝ", "Yes, delete")}</Button>
           </div>
         </Popup>
       )}

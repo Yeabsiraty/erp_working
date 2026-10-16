@@ -2,6 +2,7 @@ import { useState } from "react";
 import { t } from "../lib/i18n.js";
 import { api, setToken } from "../lib/api.js";
 import { Button, Field, ErrorNote } from "../components/ui.jsx";
+import { clearMe } from "../lib/me.js";
 import LangToggle from "../components/LangToggle.jsx";
 
 export default function Login({ onDone }) {
@@ -13,7 +14,8 @@ export default function Login({ onDone }) {
     setBusy(true); setErr(null);
     try {
       const r = await api.post("/auth/login/", f);
-      setToken(r.token);
+      setToken(r.token);      
+      clearMe();
       window.location.hash = "/";
       onDone();
     } catch (x) { setErr(x); } finally { setBusy(false); }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { api } from "../lib/api.js";
 import { dstr, todayEth } from "../lib/ethiopian.js";
 import { num, useSubmit } from "../lib/forms.js";
@@ -7,7 +8,10 @@ import { fmt, pid, proformaTotals } from "../lib/format.js";
 import { go, useResource, useSettings, useToast } from "../lib/hooks.jsx";
 import Icon from "../components/Icon.jsx";
 import { ProformaSheet, ScaledSheet } from "../components/ProformaSheet.jsx";
-import { Button, Card, ConfirmDelete, DateField, Empty, ErrorNote, Field, Loading, PageHeader } from "../components/ui.jsx";
+import SmartDateField from "../components/SmartDateField.jsx";
+import { GuardedDelete, GuardedEdit, askPassword, setGrant, takeGrant, withAt } from "../components/Guard.jsx";
+import { ALL, FilterSelect, SearchBar, Toolbar, hit } from "../components/ListTools.jsx";
+import { Button, Card, Empty, ErrorNote, Field, Loading, PageHeader } from "../components/ui.jsx";
 
 /** ፕሮፎርማና የክፍያ ጥያቄ አንድ ኮድ ይጋራሉ። */
 export const DOCS = {
@@ -31,18 +35,46 @@ export function DocList({ kind }) {
   const c = DOCS[kind];
   const toast = useToast();
   const { data, loading, error, reload } = useResource(c.api);
-  const remove = async (id) => {
-    try { await api.del(`${c.api}${id}/`); toast(t("ተሰርዟል")); reload(); } catch (e) { toast(e.message, "err"); }
+  const [search, setSearch] = useState("");
+ 
+  const [yearF, setYearF] = useState("all");
+
+  const remove = async (id, token) => {
+    try { await api.del(withAt(`${c.api}${id}/`, token)); toast(t("ተሰርዟል")); reload(); } catch (e) { toast(e.message, "err"); }
   };
-  const rows = data || [];
+  const all = data || [];
+  const years = [...new Set(all.map((p) => p.y))].sort((a, b) => b - a);
+  // const rows = all.filter((p) => {
+  //   if (yearF !== "all" && String(p.y) !== yearF) return false;
+  //   const f = {
+  //     all: [p.number, p.client, dstr(p), (p.items || []).map((i) => i.name).join(" ")],
+  //     number: [p.number], client: [p.client], items: [(p.items || []).map((i) => i.name).join(" ")],
+  //   }[field] || [p.number];
+  //   return hit(search, ...f);
+  // });
+    const rows = all.filter((p) => {
+    if (yearF !== "all" && String(p.y) !== yearF) return false;
+    return hit(search, p.client, p.number);
+  });
+  const filtering = !!search || yearF !== "all";
+  const resetFilters = () => { setSearch(""); setYearF("all"); };
+
   return (
     <>
       <PageHeader title={t(c.title)} subtitle={t("{n} ሰነዶች", { n: rows.length })}>
         <Button icon="plus" onClick={() => go(`${c.base}/new`)}>{t(c.newTitle)}</Button>
       </PageHeader>
       <ErrorNote error={error} retry={reload} />
+
+      <Toolbar active={filtering} onReset={resetFilters}>
+        <SearchBar value={search} onChange={setSearch} placeholder={bi("ደንበኛ ወይም ቁጥር ፈልግ…", "Search customer or No.…")} />
+        <FilterSelect label={t("ዓ.ም")} value={yearF} onChange={setYearF} options={[
+          ALL(), ...years.map((y) => ({ value: String(y), label: String(y) })),
+        ]} />
+      </Toolbar>
+
       <Card flush>
-        {loading && !data ? <Loading /> : rows.length === 0 ? <Empty>{t("ገና ሰነድ አልተፈጠረም።")}</Empty> : (
+        {loading && !data ? <Loading /> : rows.length === 0 ? <Empty>{filtering ? bi("ከፍለጋው ጋር የሚመሳሰል የለም።", "Nothing matches your search.") : t("ገና ሰነድ አልተፈጠረም።")}</Empty> : (
           <div className="table-wrap">
             <table className="t">
               <thead>
@@ -64,8 +96,8 @@ export function DocList({ kind }) {
                       : <td className="num">{p.items.length}</td>}
                     <td className="act">
                       <a className="icon-btn" href={`#${c.base}/${p.id}`} aria-label={t("ክፈት")}><Icon name="open" size={17} /></a>
-                      <a className="icon-btn" href={`#${c.base}/${p.id}/edit`} aria-label={t("አስተካክል")}><Icon name="edit" size={17} /></a>
-                      <ConfirmDelete onConfirm={() => remove(p.id)} />
+                      <GuardedEdit onGranted={(tok) => { setGrant(`${kind}:${p.id}`, tok); go(`${c.base}/${p.id}/edit`); }} />
+                      <GuardedDelete onConfirm={(tok) => remove(p.id, tok)} />
                     </td>
                   </tr>
                 ))}
@@ -87,11 +119,17 @@ export function DocView({ kind, id }) {
     if (data) document.title = `${data.number} — ${{ payment: "Payment Request", delivery: "Delivery Note" }[kind] || "Proforma"}`;
     return () => { document.title = old; };
   }, [data, kind]);
+  const edit = async () => {
+    const tok = await askPassword("edit");
+    if (!tok) return;
+    setGrant(`${kind}:${id}`, tok);
+    go(`${c.base}/${id}/edit`);
+  };
   return (
     <>
       <div className="pf-viewbar no-print">
         <Button variant="ghost" icon="back" onClick={() => go(c.base)}>{t("ዝርዝር")}</Button>
-        <Button variant="ghost" icon="edit" onClick={() => go(`${c.base}/${id}/edit`)}>{t("አስተካክል")}</Button>
+        <Button variant="ghost" icon="edit" onClick={edit}>{t("አስተካክል")}</Button>
         <Button icon="printer" onClick={() => window.print()}>{t("አትም / PDF")}</Button>
       </div>
       <ErrorNote error={error} retry={reload} />
@@ -149,13 +187,19 @@ export function DocEditor({ kind, id }) {
   const save = async (e) => {
     e.preventDefault();
     if (!clean.length) { toast(t("ቢያንስ አንድ ዕቃ ያስገቡ።"), "err"); return; }
+    // ማስተካከል: ከዝርዝሩ ጠቅ ሲያደርጉ የተረጋገጠው ፈቃድ፤ ከሌለ (ገጹ ከታደሰ) አሁን ይጠይቃል
+    let tok = null;
+    if (id) {
+      tok = takeGrant(`${kind}:${id}`) || (await askPassword("edit"));
+      if (!tok) return;
+    }
     const body = {
       y: num(f.y), m: num(f.m), d: num(f.d), client: f.client.trim(), items: live.items,
       ...(c.money ? { [c.rate]: num(f[c.rate]), terms: f.terms } : {}),
       ...(c.due ? { due_y: num(f.due_y), due_m: num(f.due_m), due_d: num(f.due_d) } : {}),
     };
     let saved;
-    const ok = await run(async () => { saved = id ? await api.put(`${c.api}${id}/`, body) : await api.post(c.api, body); });
+    const ok = await run(async () => { saved = id ? await api.put(withAt(`${c.api}${id}/`, tok), body) : await api.post(c.api, body); });
     if (ok) go(`${c.base}/${saved.id}`);
   };
 
@@ -167,9 +211,9 @@ export function DocEditor({ kind, id }) {
       <div className="pf-editor">
         <form className="card form" onSubmit={save}>
           <Field label={t(c.clientLabel || "ደንበኛ (Invoice to)")}><input value={f.client} onChange={(e) => set({ client: e.target.value })} required /></Field>
-          <DateField value={f} onChange={(v) => set({ y: v.y, m: v.m, d: v.d })} />
+          <SmartDateField value={f} onChange={(v) => set({ y: v.y, m: v.m, d: v.d })} />
           {c.due && (
-            <DateField label={t("መክፈያ ቀን (Payment Due)")} value={{ y: f.due_y, m: f.due_m, d: f.due_d }}
+            <SmartDateField label={t("መክፈያ ቀን (Payment Due)")} value={{ y: f.due_y, m: f.due_m, d: f.due_d }}
               onChange={(v) => set({ due_y: v.y, due_m: v.m, due_d: v.d })} />
           )}
           <div className="pf-lines">

@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { api, setToken } from "../lib/api.js";
 import { num, useSubmit } from "../lib/forms.js";
 import { useLang, useSettings, useTheme, useToast } from "../lib/hooks.jsx";
+import { askPassword, withAt } from "../components/Guard.jsx";
 import { Button, Card, Field, PageHeader, Segmented } from "../components/ui.jsx";
 
 export default function Settings() {
@@ -19,7 +21,10 @@ export default function Settings() {
 
   const save = async (e) => {
     e.preventDefault();
-     if (await run(() => api.put("/settings/", { ...f, tot_rate: num(f.tot_rate), vat_rate: num(f.vat_rate) }))) reload();
+    const tok = await askPassword("edit");        // password popup first
+    if (!tok) return;                             // cancelled -> nothing is saved
+    // wrong password is already rejected inside the popup; the server also checks the token
+    if (await run(() => api.put(withAt("/settings/", tok), { ...f, tot_rate: num(f.tot_rate), vat_rate: num(f.vat_rate) }))) reload();
   };
   const demo = async (kind) => {
     try {
@@ -43,7 +48,12 @@ export default function Settings() {
           <div className="row2">{text("website", t("ድረ-ገጽ / ኢሜይል"))}{text("phone", t("ስልክ"))}</div>
           <div className="row2">{text("handle", "Handle")}{text("social", "Social media")}</div>
           <div className="row2">{text("signer", t("ፈራሚ"))}{text("signer_role", t("የፈራሚ ሥራ"))}</div>
- 
+
+          <span className="lbl muted" style={{ fontSize: 13, fontWeight: 600 }}>{bi("የአባሪ (Attachment) ነባሪ መረጃ", "Attachment defaults")}</span>
+          <div className="row2">{text("att_bill_to", "Bill to")}{text("att_tin", "TIN")}</div>
+          <div className="row2">{text("att_address", "Address")}{text("att_ref", "Ref.")}</div>
+          <div className="row2">{text("att_fs_no", "FS. NO")}<span /></div>
+
           <Field label={t("ነባሪ VAT %")}><input type="number" step="any" min="0" max="100" value={f.tot_rate} onChange={(e) => set({ tot_rate: e.target.value })} /></Field>
           <div className="row2">
             <Field label={t("ነባሪ VAT %")}><input type="number" step="any" min="0" max="100" value={f.vat_rate} onChange={(e) => set({ vat_rate: e.target.value })} /></Field>

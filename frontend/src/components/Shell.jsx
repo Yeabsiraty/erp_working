@@ -1,8 +1,10 @@
 import { useState } from "react";
 import Icon from "./Icon.jsx";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { useSettings } from "../lib/hooks.jsx";
 import LangToggle from "./LangToggle.jsx";
+import { useMe } from "../lib/me.js";
 
 const nav = () => [
   { to: "/", icon: "dashboard", label: t("ዳሽቦርድ") },
@@ -10,20 +12,25 @@ const nav = () => [
   { to: "/stock", icon: "stock", label: t("ክምችት") },
   { to: "/debts", icon: "debts", label: t("ዕዳ") },
   { to: "/expenses", icon: "expenses", label: t("ወጪ") },
-  { to: "/proforma", icon: "proforma", label: t("ፕሮፎርማ") },
+  { to: "/proforma", icon: "proforma", label: bi("ፕሮፎርማ እና አባሪ", "Proforma & Attachment") },
   { to: "/payment", icon: "payment", label: t("የክፍያ ጥያቄ") },
   { to: "/delivery", icon: "delivery", label: t("የማድረሻ ሰነድ") },
-  { to: "/bank", icon: "payment", label: t("ባንክ") },
+  { to: "/bank", icon: "payment", label: t("ባንክ"), superOnly: true },
+  { to: "/report", icon: "proforma", label: t("ሪፖርት"), superOnly: true },
   { to: "/settings", icon: "settings", label: t("ቅንብር") },
 ];
 
-const active = (path, to) => (to === "/" ? path === "/" : path === to || path.startsWith(`${to}/`));
+const active = (path, to) => (to === "/"
+  ? path === "/"
+  : path === to || path.startsWith(`${to}/`)
+    || (to === "/proforma" && (path === "/attachment" || path.startsWith("/attachment/"))));
 
 export default function Shell({ path, theme, onTheme, onLogout, children }) {
   const { settings } = useSettings();
   const [collapsed, setCollapsed] = useState(false);
   const name = settings?.name || t("የሱቅ ደብተር");
-  const NAV = nav();
+  const me = useMe();
+  const NAV = nav().filter((n) => !n.superOnly || me?.is_superuser);
   return (
     <div className={`shell ${collapsed ? "collapsed" : ""}`}>
       <aside className="side">

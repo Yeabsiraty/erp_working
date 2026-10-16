@@ -1,5 +1,5 @@
 from decimal import Decimal
-
+import re
 from django.db import transaction
 from rest_framework import serializers
 
@@ -7,6 +7,7 @@ from . import services
 from . import ethiopian
 from .models import (BankEntry, Customer, DeliveryNote, DeliveryNoteItem, Expense, Item, Payment, PaymentRequest, PaymentRequestItem, Proforma, ProformaItem,
                      Purchase, Sale, ShopSettings)
+from .models import Attachment, AttachmentItem
 
 
 # ---------------------------------------------------------------- እገዛ
@@ -73,12 +74,29 @@ class SaleSerializer(DatedSerializer):
     total = serializers.SerializerMethodField()
     cost = serializers.SerializerMethodField()
     profit = serializers.SerializerMethodField()
+    settled = serializers.SerializerMethodField()
+    balance = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
         fields = ["id", "y", "m", "d", "item", "item_name", "qty", "price", "type",
-                  "customer", "customer_name", "paid", "total", "cost", "profit", "demo"]
+                  "customer", "customer_name", "paid", "note", "total", "cost", "profit",
+                  "settled", "balance", "demo"]
         read_only_fields = ["demo"]
+
+    def _settle(self, obj):
+        if obj.type != Sale.CREDIT:
+            return {"settled": True, "balance": Decimal("0")}
+        table = self.context.get("settle")
+        if table is None:
+            table = services.credit_settlement([obj.customer_id])
+        return table.get(obj.pk, {"settled": False, "balance": services.r2(obj.qty * obj.price - obj.paid)})
+
+    def get_settled(self, obj):
+        return self._settle(obj)["settled"]
+
+    def get_balance(self, obj):
+        return self._settle(obj)["balance"]
 
     def get_item_name(self, obj):
         return obj.item.name
@@ -239,11 +257,17 @@ class DocumentSerializer(DatedSerializer):
 class ProformaSerializer(DocumentSerializer):
     items = ProformaItemSerializer(many=True)
     item_model, parent_field, rate_field = ProformaItem, "proforma", "tot_rate"
+    attachment_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Proforma
-        fields = ["id", "y", "m", "d", "seq", "number", "client", "tot_rate", "terms", "items", "totals", "demo"]
+        fields = ["id", "y", "m", "d", "seq", "number", "client", "tot_rate", "terms", "items", "totals",
+                  "attachment_id", "demo"]
         read_only_fields = ["seq", "demo"]
+
+    def get_attachment_id(self, obj):
+        att = getattr(obj, "attachment", None)  # no attachment -> None
+        return att.pk if att else None
 
 
 # ---------------------------------------------------------------- የክፍያ ጥያቄ
@@ -297,3 +321,88 @@ class ShopSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = ShopSettings
         exclude = ["id"]
+
+
+
+
+
+# ---------------------------------------------------------------- አባሪ (Attachment)
+ISSUED_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+class AttachmentItemSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)  # ያለ መስመር ሲስተካከል id ይላካል
+
+    class Meta:
+        model = AttachmentItem
+        fields = ["id", "name", "unit", "price", "qty"]
+
+
+class AttachmentSerializer(serializers.ModelSerializer):
+    items = AttachmentItemSerializer(many=True)
+    proforma = serializers.PrimaryKeyRelatedField(queryset=Proforma.objects.all(), required=False, allow_null=True)
+    proforma_number = serializers.SerializerMethodField()
+    totals = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Attachment
+        fields = ["id", "issued", "bill_to", "tin", "address", "ref", "fs_no", "vat_rate",
+                  "proforma", "proforma_number", "items", "totals"]
+        read_only_fields = ["ref", "fs_no", "vat_rate"]
+
+    def get_proforma_number(self, obj):
+        return obj.proforma.number if obj.proforma_id else ""
+
+    def get_totals(self, obj):
+        return services.proforma_totals(list(obj.items.all()), obj.vat_rate)
+
+    def validate_issued(self, value):
+        if not ISSUED_RE.match(value):
+            raise serializers.ValidationError("ቀኑና ሰዓቱ ትክክል አይደለም።")
+        return value
+
+    def validate_proforma(self, value):
+        if value is not None:
+            clash = Attachment.objects.filter(proforma=value)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError("ለዚህ ፕሮፎርማ አባሪ አስቀድሞ ተፈጥሯል።")
+        return value
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("ቢያንስ አንድ መስመር ያስገቡ።")
+        return value
+
+    @transaction.atomic
+    def create(self, validated):
+        rows = validated.pop("items")
+        shop = ShopSettings.load()
+        validated.update(ref=shop.att_ref, fs_no=shop.att_fs_no, vat_rate=shop.vat_rate)  # ተጠቃሚው አይቀይረውም
+        obj = Attachment.objects.create(**validated)
+        AttachmentItem.objects.bulk_create(
+            [AttachmentItem(attachment=obj, **{k: v for k, v in r.items() if k != "id"}) for r in rows])
+        return obj
+
+    @transaction.atomic
+    def update(self, instance, validated):
+        rows = validated.pop("items", None)
+        for key, val in validated.items():
+            setattr(instance, key, val)
+        instance.save()
+        if rows is not None:
+            existing = {i.pk: i for i in instance.items.all()}
+            keep = set()
+            for r in rows:
+                rid = r.pop("id", None)
+                if rid in existing:  # ያለው መስመር id ሳይቀየር ይታደሳል
+                    item = existing[rid]
+                    for key, val in r.items():
+                        setattr(item, key, val)
+                    item.save()
+                    keep.add(rid)
+                else:
+                    keep.add(AttachmentItem.objects.create(attachment=instance, **r).pk)
+            instance.items.exclude(pk__in=keep).delete()
+        return instance

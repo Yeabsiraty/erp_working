@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { api } from "../lib/api.js";
 import { t } from "../lib/i18n.js";
+import { bi } from "../lib/bi.js";
 import { MONTHS, WEEKDAYS, dstr, todayEth } from "../lib/ethiopian.js";
 import { fmt, fmt0 } from "../lib/format.js";
 import { useResource, useSettings } from "../lib/hooks.jsx";
@@ -11,17 +13,41 @@ import { Donut, Kpi, Panel, Rank, compact } from "../components/Viz.jsx";
 
 const BLUES = ["#38bdf8", "#2563eb", "#22d3ee", "#818cf8", "#14b8a6", "#a78bfa"];
 const STATUS = ["#38bdf8", "#fbbf24", "#f87171"];
+const MASK = "****";
+
 const AlertIc = () => (
   <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
 );
+
+/** 👁 = ቁጥሮች ይታያሉ · 👁‍🗨 (ሰረዝ ያለበት) = ተደብቀዋል */
+function EyeButton({ shown, onClick }) {
+  const label = shown ? bi("ቁጥሮችን ደብቅ", "Hide numbers") : bi("ቁጥሮችን አሳይ", "Show numbers");
+  return (
+    <button type="button" className="icon-btn eye-btn" onClick={onClick} aria-pressed={shown} aria-label={label} title={label}>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" />
+        <circle cx="12" cy="12" r="3" />
+        {!shown && <path d="M3 3l18 18" />}
+      </svg>
+    </button>
+  );
+}
+
+/** ሲደበቅ ቁጥር፣ መለኪያና ማስታወሻ ሁሉ በ **** ይተካሉ */
+function SecretKpi({ shown, value, unit, note, ...rest }) {
+  return <Kpi {...rest} value={shown ? value : MASK} unit={shown ? unit : ""} note={shown ? note : ""} />;
+}
 
 export default function Dashboard() {
   const { settings } = useSettings();
   const { data, loading, error, reload } = useResource("/dashboard/");
   const [busy, run] = useSubmit();
+  // ገጹ በተከፈተ/በታደሰ ቁጥር ሁልጊዜ ተደብቆ ይጀምራል
+  const [shown, setShown] = useState(false);
   const now = todayEth();
   const head = (
     <PageHeader title={settings?.name || t("ዳሽቦርድ")} subtitle={`${WEEKDAYS[new Date().getDay()]}, ${dstr(now)}`}>
+      <EyeButton shown={shown} onClick={() => setShown((s) => !s)} />
       <Button variant="ghost" icon="sales" onClick={() => { window.location.hash = "/sales"; }}>{t("ሽያጭ መዝግብ")}</Button>
     </PageHeader>
   );
@@ -32,8 +58,6 @@ export default function Dashboard() {
   const p = data.period;
   const labels = data.months.map((m) => MONTHS[m.m - 1].slice(0, 3));
   const names = data.months.map((m) => MONTHS[m.m - 1]);
-  const daySpark = data.daily.filter((x) => x.d <= p.d).slice(-10).map((x) => Number(x.sales));
-  const monthSpark = data.months.map((m) => Number(m.sales));
   const splitTotal = Number(data.split.cash) + Number(data.split.credit);
   const st = data.stock_status;
   const stTotal = st.ok + st.low + st.out;
@@ -56,15 +80,11 @@ export default function Dashboard() {
           </Card>
         )}
 
-        <div className="dk-row">
-          <Kpi tone="t2" icon={<Icon name="stock" size={17} />} label={t("የክምችት ዋጋ")} value={k.stock_value} unit={t("ብር")} />
-          <Kpi tone="t1" icon={<Icon name="sales" size={17} />} label={t("የዛሬ ሽያጭ")} value={k.day_sales} unit={t("ብር")}
-            change={k.day_change} note={t("ከትናንት ጋር")} spark={daySpark} />
-          <Kpi tone="t3" icon={<Icon name="dashboard" size={17} />} label={t("የ{month} ሽያጭ", { month: MONTHS[p.m - 1] })} value={k.month_sales} unit={t("ብር")}
-            change={k.month_change} note={t("ከባለፈው ወር ጋር")} spark={monthSpark} />
-          <Kpi tone="t4" icon={<AlertIc />} label={t("ሊያልቁ የተቃረቡ")} value={k.low_count} unit={t("ዕቃ")}
+        <div className="dk-row three">
+          <SecretKpi shown={shown} tone="t2" icon={<Icon name="stock" size={17} />} label={t("የክምችት ዋጋ")} value={k.stock_value} unit={t("ብር")} />
+          <SecretKpi shown={shown} tone="t4" icon={<AlertIc />} label={t("ሊያልቁ የተቃረቡ")} value={k.low_count} unit={t("ዕቃ")}
             note={t("{n} አልቀዋል", { n: k.out_count })} />
-          <Kpi tone="t5" icon={<Icon name="debts" size={17} />} label={t("ጠቅላላ ዕዳ")} value={k.debt_total} unit={t("ብር")}
+          <SecretKpi shown={shown} tone="t5" icon={<Icon name="debts" size={17} />} label={t("ጠቅላላ ዕዳ")} value={k.debt_total} unit={t("ብር")}
             note={t("{n} ተበዳሪዎች", { n: k.debtors })} />
         </div>
 

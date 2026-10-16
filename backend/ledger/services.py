@@ -2,7 +2,7 @@
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
-from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+from django.db.models import DecimalField, ExpressionWrapper, F, IntegerField, Sum
 
 from . import ethiopian
 from .models import (BankEntry, Customer, DeliveryNote, Expense, Item, Payment, PaymentRequest, Proforma, ProformaItem,
@@ -170,11 +170,7 @@ def dashboard(y: int, m: int, d: int) -> dict:
                  Sale.objects.filter(y=y, m=m).values("d").order_by().annotate(t=Sum(SALE_TOTAL))}
     daily = [{"d": dd, "sales": r2(daily_raw.get(dd))} for dd in range(1, ethiopian.max_day(y, m) + 1)]
 
-    day_sales = _sales_of(y=y, m=m, d=d)
-    py, pm, pd = _prev_day(y, m, d)
-    prev_day_sales = _sales_of(y=py, m=pm, d=pd)
-    pym, pmm = _prev_month(y, m)
-    prev_month_sales = _sales_of(y=pym, m=pmm)
+ 
 
     cash_m = _sum(Sale.objects.filter(y=y, m=m, type=Sale.CASH), expr=SALE_TOTAL)
     credit_m = _sum(Sale.objects.filter(y=y, m=m, type=Sale.CREDIT), expr=SALE_TOTAL)
@@ -205,8 +201,7 @@ def dashboard(y: int, m: int, d: int) -> dict:
         "period": {"y": y, "m": m, "d": d},
         "is_empty": not items,
         "kpis": {
-            "day_sales": day_sales, "day_change": _pct(day_sales, prev_day_sales),
-            "month_sales": cur["sales"], "month_change": _pct(cur["sales"], prev_month_sales),
+  
             "stock_value": sum((st["value"] for _, st in rows), ZERO),
             "debt_total": sum((c["balance"] for c in cust.values()), ZERO),
             "debtors": sum(1 for c in cust.values() if c["balance"] > 0),
@@ -231,7 +226,7 @@ def dashboard(y: int, m: int, d: int) -> dict:
     }
 
 
-def bank_summary(y: int, m: int) -> dict:
+def bank_summary(y: int, m: int, d: int) -> dict:
     """ለባንክ ገጽ — ትርፍ፣ ገንዘብና ካፒታል (በይለፍ ቃል የተጠበቀ)።"""
     sales_year = {r["m"]: r for r in
                   Sale.objects.filter(y=y).values("m").order_by()
@@ -251,6 +246,10 @@ def bank_summary(y: int, m: int) -> dict:
     pym, pmm = _prev_month(y, m)
     prev_net = _net_of(y=pym, m=pmm)
     prev_year_net = _net_of(y=y - 1)
+    day_sales = _sales_of(y=y, m=m, d=d)
+    py, pm, pd = _prev_day(y, m, d)
+    prev_day_sales = _sales_of(y=py, m=pm, d=pd)
+    prev_month_sales = _sales_of(y=pym, m=pmm)
 
     bank_all = _sum(BankEntry.objects.all(), field="amount")
     bank_debt = _sum(BankEntry.objects.filter(kind=BankEntry.DEBT, repaid=False), field="amount")
@@ -287,6 +286,8 @@ def bank_summary(y: int, m: int) -> dict:
             "month_gross": cur["gross"], "month_expenses": cur["expenses"],
             "year_net": tot["net"], "year_net_change": _pct(tot["net"], prev_year_net),
             "year_sales": tot["sales"],
+            "day_sales": day_sales, "day_change": _pct(day_sales, prev_day_sales),
+            "month_sales": cur["sales"], "month_change": _pct(cur["sales"], prev_month_sales),
         },
         "capital": {
             "opening_stock": opening_stock, "initial": initial,
@@ -355,3 +356,157 @@ def clear_demo() -> None:
     DeliveryNote.objects.filter(demo=True).delete()
     Customer.objects.filter(demo=True).delete()
     Item.objects.filter(demo=True).delete()
+
+
+# ---------------------------------------------------------------- ዱቤ ሽያጭ — ተከፍሏል / አልተከፈለም
+def credit_settlement(customer_ids=None) -> dict:
+    """{sale_id: {"settled": bool, "balance": Decimal}}
+
+    ክፍያዎች የደንበኛ እንጂ የአንድ ሽያጭ አይደሉም፤ ስለዚህ ከቅድመ ክፍያ በኋላ የተከፈለው ገንዘብ
+    ለደንበኛው በጣም አሮጌ ዱቤ ሽያጭ መጀመሪያ ይመደባል (FIFO)።"""
+    sales = Sale.objects.filter(type=Sale.CREDIT, customer_id__isnull=False)
+    if customer_ids is not None:
+        sales = sales.filter(customer_id__in=list(customer_ids))
+    sales = sales.order_by("customer_id", "y", "m", "d", "id")
+    pays = {r["customer_id"]: r["t"] for r in
+            Payment.objects.values("customer_id").order_by().annotate(t=Sum("amount"))}
+    pool, out = {}, {}
+    for s in sales:
+        due = r2(s.qty * s.price) - r2(s.paid)
+        avail = pool.setdefault(s.customer_id, r2(pays.get(s.customer_id)))
+        take = min(avail, max(due, ZERO))
+        pool[s.customer_id] = avail - take
+        balance = due - take
+        out[s.pk] = {"settled": balance <= 0, "balance": max(balance, ZERO)}
+    return out
+
+
+def debt_details() -> dict:
+    """{customer_id: {"unpaid": [...], "settled": [...]}}
+
+    unpaid  -> every unpaid credit sale with its REMAINING balance
+               (the sum equals the customer's total balance)
+    settled -> every fully paid credit sale with its full amount"""
+    sales = (Sale.objects.filter(type=Sale.CREDIT, customer_id__isnull=False)
+             .order_by("customer_id", "y", "m", "d", "id"))
+    table = credit_settlement()
+    out = {}
+    for s in sales:
+        info = table.get(s.pk, {"settled": False, "balance": ZERO})
+        bucket = out.setdefault(s.customer_id, {"unpaid": [], "settled": []})
+        row = {"id": s.pk, "y": s.y, "m": s.m, "d": s.d}
+        if info["settled"]:
+            bucket["settled"].append({**row, "amount": r2(s.qty * s.price)})
+        else:
+            bucket["unpaid"].append({**row, "amount": info["balance"]})
+    return out
+
+
+# ---------------------------------------------------------------- ሪፖርት
+ALL_SECTIONS = ("summary", "sales", "purchases", "stock", "debts", "expenses", "bank")
+DKEY = ExpressionWrapper(F("y") * 10000 + F("m") * 100 + F("d"), output_field=IntegerField())
+
+
+def _between(qs, start, end):
+    """ቀኑ start እና end (ሁለቱንም ጨምሮ) መካከል ያሉ መዝገቦች። start/end = (y, m, d) ኢትዮጵያ።"""
+    key = lambda t: t[0] * 10000 + t[1] * 100 + t[2]  # noqa: E731
+    return qs.annotate(_k=DKEY).filter(_k__gte=key(start), _k__lte=key(end))
+
+
+def _ymd(o):
+    return {"y": o.y, "m": o.m, "d": o.d}
+
+
+def report(*, start, end, sections, item=None, customer=None, sale_type="", category="",
+           bank_kind="", debt_status="") -> dict:
+    sales_qs = _between(Sale.objects.select_related("item", "customer"), start, end)
+    purchases_qs = _between(Purchase.objects.select_related("item"), start, end)
+    expenses_qs = _between(Expense.objects.all(), start, end)
+    payments_qs = _between(Payment.objects.select_related("customer"), start, end)
+    bank_qs = _between(BankEntry.objects.all(), start, end)
+    if item:
+        sales_qs, purchases_qs = sales_qs.filter(item_id=item), purchases_qs.filter(item_id=item)
+    if customer:
+        sales_qs, payments_qs = sales_qs.filter(customer_id=customer), payments_qs.filter(customer_id=customer)
+    if sale_type in (Sale.CASH, Sale.CREDIT):
+        sales_qs = sales_qs.filter(type=sale_type)
+    if category:
+        expenses_qs = expenses_qs.filter(cat__icontains=category)
+    if bank_kind in (BankEntry.OWN, BankEntry.DEBT):
+        bank_qs = bank_qs.filter(kind=bank_kind)
+
+    out = {"period": {"from": dict(zip("ymd", start)), "to": dict(zip("ymd", end))}}
+
+    if "summary" in sections:
+        sales_total = _sum(sales_qs, expr=SALE_TOTAL)
+        cost = _sum(sales_qs, expr=SALE_COST)
+        spent = _sum(expenses_qs, field="amount")
+        out["summary"] = {
+            "sales": sales_total, "cost": cost, "gross": sales_total - cost,
+            "expenses": spent, "net": sales_total - cost - spent,
+            "purchases": _sum(purchases_qs, expr=SALE_TOTAL),
+            "cash_sales": _sum(sales_qs.filter(type=Sale.CASH), expr=SALE_TOTAL),
+            "credit_sales": _sum(sales_qs.filter(type=Sale.CREDIT), expr=SALE_TOTAL),
+            "upfront": _sum(sales_qs.filter(type=Sale.CREDIT), field="paid"),
+            "collected": _sum(payments_qs, field="amount"),
+            "deposits": _sum(bank_qs, field="amount"),
+            "sales_count": sales_qs.count(),
+            "stock_value": sum((st["value"] for st in item_stats().values()), ZERO),
+            "debt_total": sum((c["balance"] for c in customer_stats().values()), ZERO),
+        }
+
+    if "sales" in sections:
+        rows = list(sales_qs.order_by("y", "m", "d", "id"))
+        settle = credit_settlement({s.customer_id for s in rows if s.customer_id})
+        out["sales"] = [{
+            **_ymd(s), "id": s.pk, "item": s.item.name, "qty": s.qty, "price": s.price,
+            "total": r2(s.qty * s.price), "cost": r2(s.qty * s.item.buy),
+            "profit": r2(s.qty * s.price - s.qty * s.item.buy), "type": s.type,
+            "customer": s.customer.name if s.customer else "", "paid": s.paid,
+            "settled": s.type != Sale.CREDIT or settle.get(s.pk, {}).get("settled", False),
+            "balance": settle.get(s.pk, {}).get("balance", ZERO) if s.type == Sale.CREDIT else ZERO,
+        } for s in rows]
+
+    if "purchases" in sections:
+        out["purchases"] = [{
+            **_ymd(p), "id": p.pk, "item": p.item.name, "unit": p.item.unit, "qty": p.qty,
+            "price": p.price, "total": r2(p.qty * p.price), "supplier": p.supplier,
+        } for p in purchases_qs.order_by("y", "m", "d", "id")]
+
+    if "stock" in sections:
+        items = Item.objects.all()
+        if item:
+            items = items.filter(pk=item)
+        items = list(items)
+        stats = item_stats(items)
+        sold_p = {r["item_id"]: r["t"] for r in sales_qs.values("item_id").order_by().annotate(t=Sum("qty"))}
+        bought_p = {r["item_id"]: r["t"] for r in purchases_qs.values("item_id").order_by().annotate(t=Sum("qty"))}
+        out["stock"] = [{
+            "id": i.pk, "name": i.name, "unit": i.unit, "buy": i.buy, "sell": i.sell, "init": i.init,
+            **stats[i.pk], "period_sold": sold_p.get(i.pk) or ZERO, "period_bought": bought_p.get(i.pk) or ZERO,
+        } for i in items]
+
+    if "debts" in sections:
+        cs = Customer.objects.all()
+        if customer:
+            cs = cs.filter(pk=customer)
+        cs = list(cs)
+        stats = customer_stats(cs)
+        rows = [{"id": c.pk, "name": c.name, "phone": c.phone, **stats[c.pk]} for c in cs]
+        if debt_status in ("owes", "clear"):
+            rows = [r for r in rows if r["status"] == debt_status]
+        out["debts"] = {
+            "customers": rows,
+            "payments": [{**_ymd(p), "id": p.pk, "customer": p.customer.name, "amount": p.amount, "note": p.note}
+                         for p in payments_qs.order_by("y", "m", "d", "id")],
+        }
+
+    if "expenses" in sections:
+        out["expenses"] = [{**_ymd(e), "id": e.pk, "cat": e.cat, "note": e.note, "amount": e.amount}
+                           for e in expenses_qs.order_by("y", "m", "d", "id")]
+
+    if "bank" in sections:
+        out["bank"] = [{**_ymd(b), "id": b.pk, "amount": b.amount, "kind": b.kind, "reason": b.reason,
+                        "repaid": b.repaid, "rep_y": b.rep_y, "rep_m": b.rep_m, "rep_d": b.rep_d}
+                       for b in bank_qs.order_by("y", "m", "d", "id")]
+    return out

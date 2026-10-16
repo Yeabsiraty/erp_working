@@ -71,6 +71,7 @@ class Sale(Dated):
     type = models.CharField(max_length=10, choices=TYPES, default=CASH)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, null=True, blank=True, related_name="sales")
     paid = money()  # ዱቤ ሲሆን ቅድሚያ የተከፈለ
+    note = models.CharField("ማስታወሻ", max_length=500, blank=True)
 
     def __str__(self):
         return f"{self.date_label} · {self.item}"
@@ -211,6 +212,11 @@ class ShopSettings(models.Model):
     social = models.CharField(max_length=80, default="@abrsodesign", blank=True)
     signer = models.CharField(max_length=120, default="Yohannes Tadu", blank=True)
     signer_role = models.CharField(max_length=80, default="G.MANAGER", blank=True)
+    att_bill_to = models.CharField(max_length=160, default="", blank=True)
+    att_tin = models.CharField(max_length=60, default="", blank=True)
+    att_address = models.CharField(max_length=200, default="", blank=True)
+    att_ref = models.CharField(max_length=80, default="", blank=True)
+    att_fs_no = models.CharField(max_length=80, default="", blank=True)
     tot_rate = models.DecimalField(max_digits=5, decimal_places=2, default=15,
                                    validators=[MinValueValidator(0), MaxValueValidator(100)])
     terms = models.TextField(
@@ -237,3 +243,37 @@ class ShopSettings(models.Model):
 
     def __str__(self):
         return self.name
+
+
+
+
+class Attachment(models.Model):
+    """አባሪ (ATTACHMENT) — ከፕሮፎርማ ወይም በቀጥታ የሚፈጠር ሰነድ።"""
+
+    issued = models.CharField("ቀንና ሰዓት", max_length=19)  # "2026-10-16 12:00:19"
+    bill_to = models.CharField(max_length=160, blank=True)
+    tin = models.CharField(max_length=60, blank=True)
+    address = models.CharField(max_length=200, blank=True)
+    ref = models.CharField(max_length=80, blank=True)    # ከቅንብር ይገለበጣል
+    fs_no = models.CharField(max_length=80, blank=True)  # ከቅንብር ይገለበጣል
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=15,
+                                   validators=[MinValueValidator(0), MaxValueValidator(100)])
+    proforma = models.OneToOneField(Proforma, null=True, blank=True, on_delete=models.SET_NULL,
+                                    related_name="attachment")
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self):
+        return f"Attachment {self.pk}"
+
+
+class AttachmentItem(models.Model):
+    attachment = models.ForeignKey(Attachment, on_delete=models.CASCADE, related_name="items")
+    name = models.CharField(max_length=300, blank=True)   # Description
+    unit = models.CharField(max_length=30, blank=True)
+    qty = quantity()
+    price = money()
+
+    class Meta:
+        ordering = ["id"]

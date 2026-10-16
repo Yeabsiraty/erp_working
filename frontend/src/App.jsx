@@ -13,7 +13,9 @@ import Expenses from "./pages/Expenses.jsx";
 import { DocEditor, DocList, DocView } from "./pages/Documents.jsx";
 import Settings from "./pages/Settings.jsx";
 import Bank from "./pages/Bank.jsx";
-
+import Report from "./pages/Report.jsx";
+import ProformaPage from "./pages/Proforma.jsx";
+import { AttachmentEditor, AttachmentView } from "./pages/Attachments.jsx";
 function docRoute(path, kind, base) {
   if (path === base) return <DocList kind={kind} />;
   if (path === `${base}/new`) return <DocEditor kind={kind} />;
@@ -24,7 +26,21 @@ function docRoute(path, kind, base) {
   return null;
 }
 
+function attachmentRoute(path) {
+  if (path === "/attachment/new") return <AttachmentEditor key="new" />;
+  let m = path.match(/^\/attachment\/from\/(\d+)$/);
+  if (m) return <AttachmentEditor fromProforma={m[1]} key={`pf${m[1]}`} />;
+  m = path.match(/^\/attachment\/(\d+)\/edit$/);
+  if (m) return <AttachmentEditor id={m[1]} key={`e${m[1]}`} />;
+  m = path.match(/^\/attachment\/(\d+)$/);
+  if (m) return <AttachmentView id={m[1]} key={`v${m[1]}`} />;
+  return null;
+}
+
 function route(path) {
+  if (path === "/proforma") return <ProformaPage />;
+  const att = attachmentRoute(path);
+  if (att) return att;
   const doc = docRoute(path, "proforma", "/proforma") || docRoute(path, "payment", "/payment") || docRoute(path, "delivery", "/delivery");
   if (doc) return doc;
   switch (path) {
@@ -33,6 +49,7 @@ function route(path) {
     case "/debts": return <Debts />;
     case "/expenses": return <Expenses />;
     case "/bank": return <Bank />;
+    case "/report": return <Report />;
     case "/settings": return <Settings />;
     default: return <Dashboard />;
   }

@@ -1,3 +1,4 @@
+from django.contrib import admin
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
@@ -14,12 +15,15 @@ router.register("bank", views.BankEntryViewSet)
 router.register("proformas", views.ProformaViewSet)
 router.register("payment-requests", views.PaymentRequestViewSet)
 router.register("delivery-notes", views.DeliveryNoteViewSet)
-
+router.register("attachments", views.AttachmentViewSet)
 urlpatterns = [
     path("auth/login/", views.LoginView.as_view()),
     path("auth/logout/", views.LogoutView.as_view()),
     path("auth/me/", views.MeView.as_view()),
     path("auth/bank-unlock/", views.BankUnlockView.as_view()),
+    path("auth/report-unlock/", views.ReportUnlockView.as_view()),
+    path("auth/verify-password/", views.VerifyPasswordView.as_view()),
+    path("report/", views.report_view),
     path("bank-summary/", views.bank_summary),
     path("dashboard/", views.dashboard),
     path("today/", views.today),
@@ -27,4 +31,5 @@ urlpatterns = [
     path("demo/load/", views.demo_load),
     path("demo/clear/", views.demo_clear),
     path("", include(router.urls)),
+    path("admin/", admin.site.urls),
 ]
