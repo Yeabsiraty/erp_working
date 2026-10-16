@@ -5,3 +5,5 @@ db.sqlite3
 node_modules/
 frontend/dist/
 .venv/
+backend/.venv/
+backend/__pycache__/
